@@ -1,0 +1,44 @@
+import { describe, expect, it, beforeEach, vi } from 'vitest';
+import { initialData, type Delivery, type Innings, type Match } from './model';
+import { matchResult, normalize, qualifiers, replay, standings, stats } from './engine';
+import { loadData, STORAGE_KEY, validateData } from './storage';
+const base=():Innings=>({batting:'A',bowling:'B',battingIds:[3,9,14,18],bowlingIds:[2,6,11],openers:[3,9],overs:4,maxWickets:3,events:[]});
+let id=0;
+const ball=(runs=0,patch:Partial<Delivery>={}):Delivery=>({id:String(++id),bowler:2,runs,extra:'none',extraRuns:0,...patch});
+const innings=(events:Delivery[])=>({...base(),events});
+function full(batting:string,bowling:string,runs:number):Innings {const d=initialData();const bat=d.teams.find(t=>t.id===batting)!.players.map(p=>p.id),bowl=d.teams.find(t=>t.id===bowling)!.players.map(p=>p.id);return {batting,bowling,battingIds:bat,bowlingIds:bowl,openers:[bat[0],bat[1]],overs:4,maxWickets:10,events:Array.from({length:24},(_,n)=>ball(n===0?runs:0,{bowler:bowl[Math.floor(n/6)%2]}))};}
+const complete=(m:Match,winner:string)=>({...m,overs:4,innings:[full(m.home,m.away,winner===m.home?4:0),{...full(m.away,m.home,winner===m.away?1:0),events:winner===m.away?full(m.away,m.home,1).events.slice(0,1):full(m.away,m.home,0).events}]});
+describe('deterministic scoring',()=>{
+ it('six legal balls complete an over and rotate ends',()=>{const s=replay(innings(Array.from({length:6},()=>ball())));expect(s.balls).toBe(6);expect(s.striker).toBe(9);});
+ it('wides add extras without balls faced or legal deliveries',()=>{const s=replay(innings([ball(0,{extra:'wide',extraRuns:2})]));expect(s.runs).toBe(2);expect(s.balls).toBe(0);expect(s.bat[3].balls).toBe(0);expect(s.striker).toBe(9);expect(s.bowl[2].runs).toBe(2);});
+ it('no-ball bat runs and penalty are attributed separately',()=>{const s=replay(innings([ball(4,{extra:'no-ball',extraRuns:1})]));expect(s.runs).toBe(5);expect(s.balls).toBe(0);expect(s.bat[3].runs).toBe(4);expect(s.extras['no-ball']).toBe(1);expect(s.freeHit).toBe(true);});
+ it('no-ball leg byes do not charge the batter or bowler',()=>{const s=replay(innings([ball(0,{extra:'no-ball',extraRuns:1,noBallExtras:{kind:'leg-bye',runs:3}})]));expect(s.runs).toBe(4);expect(s.bowl[2].runs).toBe(1);expect(s.extras['leg-bye']).toBe(3);expect(s.striker).toBe(9);});
+ it('byes use a ball but are not charged to bowler or batter',()=>{const s=replay(innings([ball(0,{extra:'bye',extraRuns:3})]));expect(s.runs).toBe(3);expect(s.balls).toBe(1);expect(s.bowl[2].runs).toBe(0);expect(s.bat[3].runs).toBe(0);expect(s.striker).toBe(9);});
+ it('rotates on odd runs and then at the end of the over',()=>{const s=replay(innings([...Array.from({length:5},()=>ball()),ball(1)]));expect(s.striker).toBe(3);expect(s.nonStriker).toBe(9);});
+ it('requires a new bowler after six legal deliveries',()=>{const six=Array.from({length:6},()=>ball());expect(()=>replay(innings([...six,ball()]))).toThrow('different bowler');expect(replay(innings([...six,ball(0,{bowler:6})])).balls).toBe(7);});
+ it('holds the same bowler after a wide starts a new over',()=>{const events=[...Array.from({length:6},()=>ball()),ball(0,{bowler:6,extra:'wide',extraRuns:1})];expect(()=>replay(innings([...events,ball()]))).toThrow();expect(replay(innings([...events,ball(0,{bowler:6})])).balls).toBe(7);});
+ it('rejects mid-over bowler changes',()=>expect(()=>replay(innings([ball(),ball(0,{bowler:6})]))).toThrow('end of an over'));
+ it('records a caught wicket and a new batter',()=>{const s=replay(innings([ball(0,{wicket:{type:'Caught',player:3,next:14,fielder:11}})]));expect(s.wickets).toBe(1);expect(s.bowl[2].wickets).toBe(1);expect(s.striker).toBe(14);expect(s.fow[0]).toMatchObject({score:0,player:3,balls:1});});
+ it('does not credit a run out to the bowler',()=>{const s=replay(innings([ball(1,{wicket:{type:'Run out',player:9,next:14}})]));expect(s.wickets).toBe(1);expect(s.bowl[2].wickets).toBe(0);expect(s.striker).toBe(14);expect(s.nonStriker).toBe(3);});
+ it('disallows bowled dismissals on a free hit and carries a free hit over a wide',()=>{const events=[ball(0,{extra:'no-ball',extraRuns:1}),ball(0,{extra:'wide',extraRuns:1})];expect(()=>replay(innings([...events,ball(0,{wicket:{type:'Bowled',player:3,next:14}})]))).toThrow('free hit');expect(replay(innings([...events,ball()])).freeHit).toBe(false);});
+ it('ends all-out without requiring another batter and rejects more deliveries',()=>{const b={...base(),maxWickets:1,battingIds:[3,9],events:[ball(0,{wicket:{type:'Bowled',player:3}})]};expect(replay(b).done).toBe(true);expect(()=>replay({...b,events:[...b.events,ball()]})).toThrow('complete');});
+ it('undo replays the exact prior state',()=>{const prior=innings([ball(2)]),next={...prior,events:[...prior.events,ball(1)]};expect(replay({...next,events:next.events.slice(0,-1)})).toEqual(replay(prior));});
+ it('chase ends as soon as the target is reached',()=>{expect(replay(innings([ball(4)]),3).done).toBe(true);expect(()=>replay(innings([ball(4),ball()]),3)).toThrow('complete');});
+ it('winning wide ends chase without a legal ball',()=>{expect(replay(innings([ball(0,{extra:'wide',extraRuns:1})]),1)).toMatchObject({runs:1,balls:0,done:true});});
+});
+describe('tournament calculations',()=>{
+ it('starts with 44 distinct IDs, six league fixtures, and no fake results',()=>{const d=initialData();expect(new Set(d.teams.flatMap(t=>t.players.map(p=>p.id))).size).toBe(44);expect(standings(d).every(r=>r.played===0&&r.points===0)).toBe(true);expect(qualifiers(d)).toEqual([]);});
+ it('calculates win/loss points and NRR',()=>{const d=initialData();d.matches[0]=complete(d.matches[0],'A');const rows=standings(d);expect(rows.find(r=>r.team==='A')).toMatchObject({points:2,won:1,played:1,nrr:1});expect(rows.find(r=>r.team==='B')).toMatchObject({points:0,lost:1,nrr:-1});});
+ it('uses allocated overs for all-out NRR',()=>{const d=initialData();const a=full('A','B',0);a.maxWickets=1;a.battingIds=a.battingIds.slice(0,2);a.events=[ball(0,{wicket:{type:'Bowled',player:3}})];const b=full('B','A',1);b.events=b.events.slice(0,1);d.matches[0]={...d.matches[0],innings:[a,b]};const r=standings(d).find(r=>r.team==='A')!;expect(r.forBalls).toBe(24);expect(r.againstBalls).toBe(1);});
+ it('awards tie and no-result points',()=>{const d=initialData();d.matches[0]={...d.matches[0],innings:[full('A','B',0),full('B','A',0)]};d.matches[1].abandoned=true;expect(standings(d).every(r=>r.points===1)).toBe(true);});
+ it('derives and inserts finalists after all six matches',()=>{const d=initialData();d.matches=d.matches.map(m=>m.id<7?complete(m,m.home):m);expect(qualifiers(d)).toHaveLength(2);expect(normalize(d).matches[6].home).toBe(standings(d)[0].team);});
+ it('resolves Super Over winners and excludes Super Over from NRR',()=>{const d=initialData(),m={...d.matches[0],innings:[full('A','B',0),full('B','A',0)]};const a={...full('A','B',1),overs:1,maxWickets:2};a.events=a.events.slice(0,6);const b={...full('B','A',2),overs:1,maxWickets:2};b.events=b.events.slice(0,1);m.innings.push(a,b);expect(matchResult(m).winner).toBe('B');d.matches[0]=m;expect(standings(d).find(r=>r.team==='B')).toMatchObject({points:2,nrr:0});});
+ it('statistics derive runs wickets and catches from saved events',()=>{const d=initialData();d.matches[0].innings=[innings([ball(4),ball(0,{wicket:{type:'Caught',player:3,next:14,fielder:11}})])];expect(stats(d).find(r=>r.id===3)).toMatchObject({runs:4,highest:4,fours:1});expect(stats(d).find(r=>r.id===2)?.wickets).toBe(1);expect(stats(d).find(r=>r.id===11)?.catches).toBe(1);});
+});
+describe('storage and editable identities',()=>{
+ beforeEach(()=>{const memory=new Map();vi.stubGlobal('localStorage',{getItem:(key:string)=>memory.get(key)??null,setItem:(key:string,val:string)=>memory.set(key,val)});});
+ it('reload preserves roster edits and deliveries',()=>{const d=initialData();d.teams[0].players[0].name='Edited captain';d.matches[0].innings=[{...full('A','B',4),overs:6,events:full('A','B',4).events.slice(0,1)}];localStorage.setItem(STORAGE_KEY,JSON.stringify(d));const loaded=loadData();expect(loaded.error).toBe('');expect(loaded.data.teams[0].players[0].name).toBe('Edited captain');expect(replay(loaded.data.matches[0].innings[0]).runs).toBe(4);});
+ it('rejects duplicate IDs and malformed files',()=>{const d=initialData();d.teams[1].players[0].id=3;expect(()=>validateData(d)).toThrow();expect(()=>validateData({version:1})).toThrow();});
+ it('does not overwrite corrupted saved data on load',()=>{localStorage.setItem(STORAGE_KEY,'bad');expect(loadData().error).not.toBe('');expect(localStorage.getItem(STORAGE_KEY)).toBe('bad');});
+ it('renaming two similarly named players retains distinct identities',()=>{const d=initialData();d.teams[0].players.find(p=>p.id===14)!.name='Sam';d.teams[0].players.find(p=>p.id===39)!.name='Sam';expect(validateData(d).teams[0].players.filter(p=>p.name==='Sam')).toHaveLength(2);});
+});

@@ -1,0 +1,20 @@
+OPCL 2026 deployment package
+
+READY-TO-DEPLOY BUILD
+Upload the CONTENTS of dist/ to the root of an HTTPS static website.
+The public root should contain index.html, sw.js, and assets/.
+No database, server runtime, or environment variables are required.
+
+BUILD FROM SOURCE
+Install Node.js 20.19 or newer.
+Run npm install, then npm run build. Publish directory: dist.
+Run npm run dev for local development and npm test for tests.
+The included pnpm lockfile can alternatively be used with pnpm.
+
+TOURNAMENT DATA
+Tournament edits and scores are stored in each browser, not on the host.
+To move existing data to the deployed site, export JSON in Settings on
+the local app, then import that file in Settings on the deployed site.
+Local browser data is not included in this ZIP.
+
+See README.md for full instructions and scoring scope.
